@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+data/target/
+airflow.db
+logs/
+spark-warehouse/
+metastore_db/
+derby.log

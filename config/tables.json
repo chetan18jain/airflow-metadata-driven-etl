@@ -1,0 +1,37 @@
+{
+  "tables": [
+    {
+      "name": "orders",
+      "source_path": "data/source/orders",
+      "target_path": "data/target/orders",
+      "source_format": "csv",
+      "load_type": "incremental",
+      "watermark_column": "updated_at",
+      "primary_keys": ["order_id"],
+      "min_rows": 1,
+      "not_null_columns": ["order_id", "updated_at"]
+    },
+    {
+      "name": "customers",
+      "source_path": "data/source/customers",
+      "target_path": "data/target/customers",
+      "source_format": "csv",
+      "load_type": "incremental",
+      "watermark_column": "updated_at",
+      "primary_keys": ["customer_id"],
+      "min_rows": 1,
+      "not_null_columns": ["customer_id", "updated_at"]
+    },
+    {
+      "name": "products",
+      "source_path": "data/source/products",
+      "target_path": "data/target/products",
+      "source_format": "csv",
+      "load_type": "full",
+      "watermark_column": null,
+      "primary_keys": ["product_id"],
+      "min_rows": 1,
+      "not_null_columns": ["product_id"]
+    }
+  ]
+}
