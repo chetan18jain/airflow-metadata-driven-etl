@@ -12,6 +12,7 @@ the Airflow DAG (one call per table config) and is runnable standalone:
   python src/incremental_load.py --config config/tables.json --table orders
 """
 import argparse, json
+from config_validation import validate_tables
 from delta.tables import DeltaTable
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -63,6 +64,11 @@ def load_table(spark, cfg: dict) -> None:
          .save(cfg["target_path"]))
         print(f"{cfg['name']}: full overwrite, {source.count()} rows")
         return
+    if cfg["load_type"] != "incremental":
+        # Unreachable when the config passed validate_tables(); kept so a
+        # programmatically built cfg can never silently pick a strategy.
+        raise ValueError(
+            f"{cfg['name']}: unknown load_type {cfg['load_type']!r}")
     watermark = current_watermark(spark, cfg)
     batch = source.filter(F.col(cfg["watermark_column"]) > F.lit(watermark))
     if batch.isEmpty():
@@ -72,7 +78,7 @@ def load_table(spark, cfg: dict) -> None:
 
 def load_config(path: str) -> list:
     with open(path, encoding="utf-8") as fh:
-        return json.load(fh)["tables"]
+        return validate_tables(json.load(fh)["tables"])
 
 def main():
     parser = argparse.ArgumentParser()

@@ -9,7 +9,7 @@ no new DAG code. Tables are independent: one table failing its gate
 does not block the others. Loads run the PySpark incremental loader
 (watermark + Delta MERGE) as a subprocess so the DAG stays light.
 """
-import json, os
+import json, os, sys
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -19,9 +19,15 @@ PROJECT_HOME = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 CONFIG_PATH = os.path.join(PROJECT_HOME, "config", "tables.json")
 
+# Validate the metadata contract at parse time: a bad entry fails the
+# parse loudly here instead of generating a task chain that only fails
+# at run time. config_validation is pure stdlib, so this stays cheap.
+sys.path.insert(0, os.path.join(PROJECT_HOME, "src"))
+from config_validation import validate_tables
+
 def load_tables() -> list:
     with open(CONFIG_PATH, encoding="utf-8") as fh:
-        return json.load(fh)["tables"]
+        return validate_tables(json.load(fh)["tables"])
 
 default_args = {
     "owner": "chetan",
