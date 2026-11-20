@@ -16,6 +16,7 @@ from config_validation import validate_tables
 from delta.tables import DeltaTable
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 EPOCH = "1970-01-01 00:00:00"
 
@@ -40,6 +41,26 @@ def current_watermark(spark, cfg: dict) -> str:
     row = (spark.read.format("delta").load(target)
            .agg(F.max(cfg["watermark_column"]).alias("wm")).first())
     return str(row["wm"]) if row["wm"] is not None else EPOCH
+
+def dedupe_batch(batch, cfg):
+    """Dedupe a batch on the primary keys, keeping the LATEST row per key.
+
+    A batch can legitimately carry the same key twice (e.g. an order
+    updated twice between extracts). Delta MERGE fails on that with a
+    multiple-source-match error, and plain dropDuplicates() keeps an
+    arbitrary row, which can resurrect a stale version. Rank rows
+    within each key by the watermark column descending and keep rank 1,
+    so the newest version of each record always wins. The helper
+    column is dropped before the batch reaches the merge.
+    """
+    keys = cfg["primary_keys"]
+    watermark = cfg["watermark_column"]
+    latest_first = Window.partitionBy(*keys).orderBy(
+        F.col(watermark).desc())
+    return (batch
+            .withColumn("_rn", F.row_number().over(latest_first))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn"))
 
 def merge_into_target(spark, batch, cfg: dict) -> None:
     target_path = cfg["target_path"]
@@ -74,6 +95,7 @@ def load_table(spark, cfg: dict) -> None:
     if batch.isEmpty():
         print(f"{cfg['name']}: no rows after watermark {watermark}")
         return
+    batch = dedupe_batch(batch, cfg)
     merge_into_target(spark, batch, cfg)
 
 def load_config(path: str) -> list:
