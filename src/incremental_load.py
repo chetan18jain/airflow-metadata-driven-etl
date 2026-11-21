@@ -62,12 +62,19 @@ def dedupe_batch(batch, cfg):
             .filter(F.col("_rn") == 1)
             .drop("_rn"))
 
-def merge_into_target(spark, batch, cfg: dict) -> None:
+def merge_into_target(spark, batch, cfg: dict, batch_count: int) -> None:
+    """MERGE a batch into the Delta target; batch_count is the row count
+    already computed (once, by the caller) so no count() action runs here.
+
+    The caller persists the batch before counting, so the MERGE reuses
+    the cached plan instead of re-scanning the source and re-running
+    the dedupe window.
+    """
     target_path = cfg["target_path"]
     keys = cfg["primary_keys"]
     if not DeltaTable.isDeltaTable(spark, target_path):
         batch.write.format("delta").save(target_path)
-        print(f"{cfg['name']}: initial load, {batch.count()} rows")
+        print(f"{cfg['name']}: initial load, {batch_count} rows")
         return
     target = DeltaTable.forPath(spark, target_path)
     condition = " AND ".join(f"t.{k} = s.{k}" for k in keys)
@@ -76,14 +83,21 @@ def merge_into_target(spark, batch, cfg: dict) -> None:
      .whenMatchedUpdateAll()
      .whenNotMatchedInsertAll()
      .execute())
-    print(f"{cfg['name']}: merged {batch.count()} rows")
+    print(f"{cfg['name']}: merged {batch_count} rows")
 
 def load_table(spark, cfg: dict) -> None:
     source = read_source(spark, cfg)
     if cfg["load_type"] == "full":
-        (source.write.format("delta").mode("overwrite")
-         .save(cfg["target_path"]))
-        print(f"{cfg['name']}: full overwrite, {source.count()} rows")
+        # Persist, count once, then write from the cache — the old code
+        # called source.count() after the write, a second full scan.
+        source = source.persist()
+        try:
+            row_count = source.count()
+            (source.write.format("delta").mode("overwrite")
+             .save(cfg["target_path"]))
+        finally:
+            source.unpersist()
+        print(f"{cfg['name']}: full overwrite, {row_count} rows")
         return
     if cfg["load_type"] != "incremental":
         # Unreachable when the config passed validate_tables(); kept so a
@@ -92,11 +106,19 @@ def load_table(spark, cfg: dict) -> None:
             f"{cfg['name']}: unknown load_type {cfg['load_type']!r}")
     watermark = current_watermark(spark, cfg)
     batch = source.filter(F.col(cfg["watermark_column"]) > F.lit(watermark))
-    if batch.isEmpty():
-        print(f"{cfg['name']}: no rows after watermark {watermark}")
-        return
     batch = dedupe_batch(batch, cfg)
-    merge_into_target(spark, batch, cfg)
+    # Persist, then count ONCE: the old code ran batch.isEmpty() and then
+    # batch.count() inside merge_into_target — two extra full actions
+    # over the deduped batch. The MERGE now reads from the cache.
+    batch = batch.persist()
+    try:
+        batch_count = batch.count()
+        if batch_count == 0:
+            print(f"{cfg['name']}: no rows after watermark {watermark}")
+            return
+        merge_into_target(spark, batch, cfg, batch_count)
+    finally:
+        batch.unpersist()
 
 def load_config(path: str) -> list:
     with open(path, encoding="utf-8") as fh:
