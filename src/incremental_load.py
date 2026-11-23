@@ -12,13 +12,14 @@ the Airflow DAG (one call per table config) and is runnable standalone:
   python src/incremental_load.py --config config/tables.json --table orders
 """
 import argparse, json
+from datetime import date, datetime
 from config_validation import validate_tables
 from delta.tables import DeltaTable
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-EPOCH = "1970-01-01 00:00:00"
+EPOCH = datetime(1970, 1, 1)
 
 def get_spark(app_name: str) -> SparkSession:
     return (SparkSession.builder.appName(app_name)
@@ -34,13 +35,46 @@ def read_source(spark, cfg: dict):
         reader = reader.option("header", "true").option("inferSchema", "true")
     return reader.load(cfg["source_path"])
 
-def current_watermark(spark, cfg: dict) -> str:
+def normalize_watermark(value) -> datetime:
+    """Coerce a watermark value to a datetime — pure, Spark-free.
+
+    Delta returns max() of a timestamp column as a datetime, of a date
+    column as a date, and of a string column as a str; the epoch
+    fallback used to be a plain string too. Comparing the source
+    watermark column against a string literal makes Spark rely on an
+    implicit cast whose result depends on the column type and the
+    string's format — a date column against "2026-11-22 10:30:00", or
+    a timestamp whose string lost its fractional seconds, can silently
+    filter the wrong rows (string comparison is lexicographic, not
+    chronological, once formats drift). Normalising everything to a
+    datetime here means the extract filter always compares
+    timestamp-to-timestamp, whatever the target column's type is.
+    """
+    if value is None:
+        return EPOCH
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise TypeError(
+        f"watermark value must be a datetime, date or ISO string, "
+        f"got {type(value).__name__}: {value!r}")
+
+def current_watermark(spark, cfg: dict) -> datetime:
+    """Target's current max(watermark_column) as a datetime.
+
+    Epoch (1970-01-01) when the target table does not exist yet or
+    holds no rows. The return is always a datetime — never a string —
+    so the caller can build a typed timestamp literal for the extract.
+    """
     target = cfg["target_path"]
     if not DeltaTable.isDeltaTable(spark, target):
         return EPOCH
     row = (spark.read.format("delta").load(target)
            .agg(F.max(cfg["watermark_column"]).alias("wm")).first())
-    return str(row["wm"]) if row["wm"] is not None else EPOCH
+    return normalize_watermark(row["wm"])
 
 def dedupe_batch(batch, cfg):
     """Dedupe a batch on the primary keys, keeping the LATEST row per key.
@@ -105,7 +139,13 @@ def load_table(spark, cfg: dict) -> None:
         raise ValueError(
             f"{cfg['name']}: unknown load_type {cfg['load_type']!r}")
     watermark = current_watermark(spark, cfg)
-    batch = source.filter(F.col(cfg["watermark_column"]) > F.lit(watermark))
+    # Typed literal: F.lit() of a datetime is already a timestamp, and
+    # the explicit cast makes the intent hold even if the value ever
+    # arrives as a string — the old code compared the column against a
+    # bare string literal and relied on Spark's implicit cast.
+    batch = source.filter(
+        F.col(cfg["watermark_column"])
+        > F.lit(watermark).cast("timestamp"))
     batch = dedupe_batch(batch, cfg)
     # Persist, then count ONCE: the old code ran batch.isEmpty() and then
     # batch.count() inside merge_into_target — two extra full actions
